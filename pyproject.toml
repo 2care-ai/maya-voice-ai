@@ -5,11 +5,13 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "livekit-agents[google,silero,turn-detector,gladia,cartesia,elevenlabs]~=1.3",
+    "livekit-agents[google,silero,turn-detector,gladia,cartesia,elevenlabs,groq]~=1.3",
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit-plugins-deepgram",
     "python-dotenv>=1.2.1",
     "boto3>=1.35",
+    "redis>=5.0",
+    "supermemory>=0.1.0",
 ]
 
 [dependency-groups]
