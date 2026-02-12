@@ -1,0 +1,6 @@
+[project]
+  subdomain = "credira-tcxa6bm6"
+
+[agent]
+  id = "CA_3cRGBuHyaPh4"
+  name = "maya-agent"
