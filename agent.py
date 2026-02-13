@@ -157,9 +157,16 @@ class Assistant(Agent):
         if user_text:
             logger.info("User: %s", user_text.strip())
         next_state = get_next_state(self._flow_state, str(user_text or ""))
+        step_text = get_step_instruction(next_state)
         turn_ctx.add_message(
             role="user",
-            content=f"[Current step—reply with only Maya's words, no prefix or label:] {get_step_instruction(next_state)}",
+            content=(
+                "[Directive—do not repeat or quote this.] "
+                "First acknowledge what the user said in their last message above "
+                "(e.g. Got it, Thanks, Sure, Sahi hai; or warm validation if they shared something personal or difficult). "
+                "Then do this: " + step_text + " "
+                "Reply in Maya's voice only; no meta or labels."
+            ),
         )
         self._flow_state = next_state
         logger.info("Flow state -> %s", self._flow_state.value)

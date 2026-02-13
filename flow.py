@@ -104,24 +104,24 @@ def get_next_state(current: FlowState, user_message: str) -> FlowState:
         return FlowState.DISCOVERY_WHO
 
     if current == FlowState.DISCOVERY_WHO:
-        if _looks_like_question(msg) or _looks_like_objection(msg):
-            return current
         if _looks_like_answer_who(msg):
             return FlowState.DISCOVERY_CANCER
+        if _looks_like_question(msg) or _looks_like_objection(msg):
+            return current
         return current
 
     if current == FlowState.DISCOVERY_CANCER:
-        if _looks_like_question(msg) or _looks_like_objection(msg):
-            return current
         if _looks_like_answer_cancer(msg) or len(msg) > 15:
             return FlowState.DISCOVERY_CITY
+        if _looks_like_question(msg) or _looks_like_objection(msg):
+            return current
         return current
 
     if current == FlowState.DISCOVERY_CITY:
-        if _looks_like_question(msg) or _looks_like_objection(msg):
-            return current
         if _looks_like_answer_city(msg) or len(msg) > 3:
             return FlowState.POSITIONING
+        if _looks_like_question(msg) or _looks_like_objection(msg):
+            return current
         return current
 
     if current == FlowState.POSITIONING:
