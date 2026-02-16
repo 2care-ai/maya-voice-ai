@@ -1,13 +1,12 @@
 """
-Helper script to trigger outbound calls using LiveKit Agent Dispatch.
+Outbound calls via LiveKit using the Plivo (Indian number) SIP trunk.
 
 Usage:
-    python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp
+    python make_outbound_call_plivo.py +919500664509
+    python make_outbound_call_plivo.py +919500664509 Kiran           # agent opens with "May I speak with Kiran?"
+    python make_outbound_call_plivo.py +919500664509 Kiran my-room   # name then room (room optional)
 
-Requirements:
-    - Agent must be deployed to LiveKit Cloud
-    - SIP trunk must be configured in LiveKit dashboard
-    - Environment variables must be set in .env file
+Set LIVEKIT_SIP_TRUNK_ID_PLIVO in .env to your Plivo trunk ID from the LiveKit dashboard.
 """
 
 import asyncio
@@ -84,62 +83,67 @@ async def make_outbound_call(
     room_name: str | None = None,
 ):
     """
-    Initiate an outbound call via LiveKit SIP.
+    Initiate an outbound call via LiveKit SIP using the Plivo trunk.
 
     Args:
-        phone_number: Phone number to call (E.164 format, e.g., +919500664509)
-        sip_trunk_id: SIP trunk ID to use for the call
+        phone_number: E.164 number (e.g. +919500664509)
+        sip_trunk_id: Plivo SIP trunk ID from LiveKit dashboard
         patient_name: Optional; for diagnostic-lab leads, used in opening ("May I speak with [name]?")
-        room_name: Optional room name (auto-generated if not provided; usually omitted)
+        room_name: Optional; auto-generated if not provided (usually omitted)
     """
     if not phone_number or not sip_trunk_id:
         print("❌ Error: phone_number and sip_trunk_id are required")
         return
-    
-    # Create LiveKit API client
+
     lkapi = api.LiveKitAPI(
         url=os.getenv("LIVEKIT_URL"),
         api_key=os.getenv("LIVEKIT_API_KEY"),
-        api_secret=os.getenv("LIVEKIT_API_SECRET")
+        api_secret=os.getenv("LIVEKIT_API_SECRET"),
     )
-    
+
     if not room_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        room_name = f"outbound-call-{timestamp}"
-    
+        room_name = f"outbound-plivo-{timestamp}"
+
     meta = {
         "phone_number": phone_number,
         "sip_trunk_id": sip_trunk_id,
         "call_type": "outbound",
+        "trunk": "plivo",
         "initiated_at": datetime.now().isoformat(),
     }
     if patient_name:
         meta["patient_name"] = patient_name.strip()
         meta["lead_source"] = "diagnostic_lab"
     metadata = json.dumps(meta)
-    
-    print(f"\n📞 Initiating outbound call...")
+
+    AGENT_NAME = "maya-agent"
+
+    print(f"\n📞 Initiating outbound call (Plivo / Indian trunk)...")
     print(f"   Phone: {phone_number}")
     if patient_name:
         print(f"   Patient: {patient_name}")
     print(f"   Trunk: {sip_trunk_id}")
     print(f"   Room: {room_name}")
-    print(f"   Agent: CA_3cRGBuHyaPh4")
-    
+    print(f"   Agent: {AGENT_NAME}")
+
     try:
-        # 1. Create the room
         await lkapi.room.create_room(
-            api.CreateRoomRequest(
-                name=room_name,
-                metadata=metadata
-            )
+            api.CreateRoomRequest(name=room_name, metadata=metadata)
         )
         print(f"✅ Room created: {room_name}")
 
-        # 2. Start room composite egress (call recording to S3)
+        dispatch = await lkapi.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=AGENT_NAME,
+                room=room_name,
+                metadata=metadata,
+            )
+        )
+        print(f"✅ Agent dispatch created (dispatch_id={dispatch.id})")
+
         await _start_room_composite_egress(room_name, audio_only=True)
 
-        # 3. Start the SIP Participant (this makes the actual phone call)
         print(f"📞 Calling {phone_number}...")
         await lkapi.sip.create_sip_participant(
             api.CreateSIPParticipantRequest(
@@ -148,64 +152,64 @@ async def make_outbound_call(
                 room_name=room_name,
                 participant_identity=f"sip_{phone_number.replace('+', '')}",
                 participant_name="Maya - Everhope Oncology",
-                wait_until_answered=True
+                wait_until_answered=True,
             )
         )
         print(f"✅ SIP participant connected!")
 
         print(f"\n✅ Trigger complete!")
         print(f"   Room: {room_name}")
-        
-        # Construct the dashboard URL for monitoring
-        # Extract project name from URL if possible (fallback to credira)
+
         project_name = "credira"
         lk_url = os.getenv("LIVEKIT_URL", "")
         if "livekit.cloud" in lk_url:
             parts = lk_url.replace("https://", "").split(".")
             if parts:
                 project_name = parts[0].split("-")[0]
-        
+
         dashboard_url = f"https://cloud.livekit.io/projects/{project_name}/rooms/{room_name}"
-        
-        print(f"\n🎯 The agent will now:")
-        print(f"   1. Join the room '{room_name}'")
-        print(f"   2. Initiate an outbound call to {phone_number}")
-        print(f"   3. Wait for the callee to answer")
-        print(f"   4. Start the conversation as Maya")
-        print(f"\n💡 Monitor the call in LiveKit Dashboard:")
-        print(f"   {dashboard_url}")
-        
+
+        print(f"\n🎯 Flow:")
+        print(f"   1. Agent '{AGENT_NAME}' is dispatched to room '{room_name}'")
+        print(f"   2. Plivo dials {phone_number}; on answer, caller joins the room")
+        print(f"   3. Maya speaks and runs the conversation in the room")
+        print(f"\n💡 Monitor: {dashboard_url}")
+
     except Exception as e:
-        print(f"\n❌ Error initiating outbound call: {e}")
+        print(f"\n❌ Error: {e}")
         print(f"\nTroubleshooting:")
-        print(f"   1. Ensure agent 'CA_3cRGBuHyaPh4' is deployed to LiveKit Cloud")
-        print(f"   2. Verify SIP trunk '{sip_trunk_id}' exists in dashboard")
-        print(f"   3. Check LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET in .env")
+        print(f"   1. Ensure agent '{AGENT_NAME}' is deployed and registered with LiveKit Cloud")
+        print(f"   2. Verify Plivo SIP trunk '{sip_trunk_id}' exists in LiveKit dashboard")
+        print(f"   3. Check LIVEKIT_* and LIVEKIT_SIP_TRUNK_ID_PLIVO in .env")
         raise
     finally:
-        # Properly close the API client session to avoid warnings
         await lkapi.aclose()
 
 
 async def main():
-    if len(sys.argv) < 3:
-        print("Usage: python make_outbound_call.py <phone_number> <sip_trunk_id> [patient_name] [room_name]")
+    if len(sys.argv) < 2:
+        print("Usage: python make_outbound_call_plivo.py <phone_number> [patient_name] [room_name]")
         print("\nExample:")
-        print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp")
-        print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp Kiran")
-        print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp Kiran my-room")
+        print("  python make_outbound_call_plivo.py +919500664509")
+        print("  python make_outbound_call_plivo.py +919500664509 Kiran")
+        print("  python make_outbound_call_plivo.py +919500664509 Kiran my-room")
         print("\nRequired:")
-        print("  phone_number   - Phone number to call (with country code, e.g., +919876543210)")
-        print("  sip_trunk_id   - Your Twilio SIP trunk ID from LiveKit dashboard (starts with ST_)")
+        print("  phone_number  - E.164 format (e.g. +919876543210)")
         print("\nOptional:")
-        print("  patient_name   - For diagnostic-lab leads; agent opens with 'May I speak with [name]?'")
-        print("  room_name      - Custom room name (auto-generated if not provided; usually omitted)")
+        print("  patient_name  - For diagnostic-lab leads; agent opens with 'May I speak with [name]?'")
+        print("  room_name     - Custom room name (default: outbound-plivo-<timestamp>; usually omitted)")
+        print("\nEnv:")
+        print("  LIVEKIT_SIP_TRUNK_ID_PLIVO - Plivo SIP trunk ID from LiveKit dashboard")
         sys.exit(1)
 
     phone_number = sys.argv[1]
-    sip_trunk_id = sys.argv[2]
-    patient_name = sys.argv[3] if len(sys.argv) > 3 else None
-    room_name = sys.argv[4] if len(sys.argv) > 4 else None
+    patient_name = sys.argv[2] if len(sys.argv) > 2 else None
+    room_name = sys.argv[3] if len(sys.argv) > 3 else None
+
+    sip_trunk_id = _env("LIVEKIT_SIP_TRUNK_ID_PLIVO")
+    if not sip_trunk_id:
+        print("❌ Set LIVEKIT_SIP_TRUNK_ID_PLIVO in .env to your Plivo trunk ID (LiveKit dashboard → SIP → your Plivo trunk).")
+        sys.exit(1)
 
     await make_outbound_call(phone_number, sip_trunk_id, patient_name, room_name)
 

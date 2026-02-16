@@ -6,23 +6,43 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterable
+
+import aiohttp
 from dotenv import load_dotenv
 
 from livekit import agents, rtc
 from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
 from livekit.agents.llm import ChatContext, ChatMessage
+from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.voice import ModelSettings
 from livekit.plugins import deepgram, elevenlabs, groq, noise_cancellation, silero
 
-from flow import FlowState, get_step_instruction, get_next_state
+from livekit.agents.beta.workflows import TaskGroup
+
 from everhope_store import get_everhope_knowledge_base
+from tasks.maya_flow import (
+    ClosingTask,
+    ConfirmationTask,
+    DecisionTimelineTask,
+    DiagnosisQualificationTask,
+    GeographyTask,
+    OpeningTask,
+    ScheduleCallbackTask,
+    TreatmentStatusTask,
+)
+
+_room_agents: dict[str, "Assistant"] = {}
 
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
 
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(h)
 
 def _load_maya_instructions(compact: bool = True) -> str:
     spec = importlib.util.spec_from_file_location(
@@ -34,23 +54,36 @@ def _load_maya_instructions(compact: bool = True) -> str:
 
 AGENT_INSTRUCTIONS = _load_maya_instructions(compact=True)
 
+class _FlowResults:
+    __slots__ = ("task_results",)
+
+    def __init__(self, task_results: dict) -> None:
+        self.task_results = task_results
+
+
 class Assistant(Agent):
-    def __init__(self, chat_ctx: ChatContext | None = None) -> None:
+    def __init__(
+        self,
+        chat_ctx: ChatContext | None = None,
+        patient_name: str = "",
+    ) -> None:
         super().__init__(chat_ctx=chat_ctx, instructions=AGENT_INSTRUCTIONS)
         self._silence_task = None
         self._last_speech_time = asyncio.get_event_loop().time()
-        self._flow_state = FlowState.RECORDING_INTRO
+        self._flow_results = None
+        self._patient_name = patient_name or ""
 
     @function_tool(
-        description="Fetch Everhope Oncology center locations and details. Use when the user asks about centers, locations, addresses",
+        description="Fetch Everhope center locations and details. Use when the user asks about centers, locations, or addresses. The return value is for you to summarize in your own words—do not read it aloud verbatim; give a short spoken answer (e.g. city names and one line per center).",
         raw_schema={
             "type": "function",
             "name": "get_center_info",
-            "description": "Fetch Everhope Oncology center locations and details. Use when the user asks about centers, locations, addresses",
+            "description": "Fetch Everhope center locations and details. Use when the user asks about centers, locations, or addresses. Summarize the result in your own words when replying; do not read the raw output aloud.",
             "parameters": {
                 "type": "object",
-                "properties": {},
-                "required": [],
+                "properties": {
+                    "_": {"type": "string", "description": "Unused; omit or leave empty."},
+                },
             },
         },
     )
@@ -85,10 +118,63 @@ class Assistant(Agent):
         def on_user_speech(_msg):
             self._last_speech_time = asyncio.get_event_loop().time()
 
+        @self.session.on("conversation_item_added")
+        def on_conversation_item(ev: ConversationItemAddedEvent) -> None:
+            if isinstance(ev.item, ChatMessage) and ev.item.role == "assistant":
+                text = (ev.item.text_content or "").strip()
+                if text:
+                    logger.info("[Agent speaks] %s", text)
+
         self._silence_task = asyncio.create_task(self._monitor_silence())
 
+        opening_group = TaskGroup(chat_ctx=self.chat_ctx)
+        opening_group.add(
+            lambda: OpeningTask(patient_name=self._patient_name),
+            id="opening",
+            description="Opening and good time to speak",
+        )
+        results_opening = await opening_group
+        opening_result = results_opening.task_results["opening"]
+        good_time = opening_result.good_time
+
+        all_task_results: dict = {"opening": opening_result}
+
+        if good_time:
+            collect_group = TaskGroup(chat_ctx=self.chat_ctx)
+            collect_group.add(lambda: ConfirmationTask(), id="confirmation", description="Discuss report with doctor")
+            collect_group.add(lambda: DiagnosisQualificationTask(), id="diagnosis", description="Diagnosis stage")
+            collect_group.add(lambda: TreatmentStatusTask(), id="treatment", description="Treatment status")
+            results_collect = await collect_group
+            all_task_results.update(results_collect.task_results)
+
+            treatment_result = results_collect.task_results["treatment"]
+            treatment_started = getattr(treatment_result, "started", False)
+
+            if treatment_started:
+                rest_group = TaskGroup(chat_ctx=self.chat_ctx)
+                rest_group.add(lambda: GeographyTask(), id="geography", description="Geography and travel")
+                rest_group.add(lambda: ClosingTask(is_callback_path=False), id="closing", description="Thank and close")
+                results_rest = await rest_group
+                all_task_results.update(results_rest.task_results)
+            else:
+                rest_group = TaskGroup(chat_ctx=self.chat_ctx)
+                rest_group.add(lambda: DecisionTimelineTask(), id="timeline", description="Decision timeline")
+                rest_group.add(lambda: GeographyTask(), id="geography", description="Geography and travel")
+                rest_group.add(lambda: ClosingTask(is_callback_path=False), id="closing", description="Thank and close")
+                results_rest = await rest_group
+                all_task_results.update(results_rest.task_results)
+        else:
+            callback_group = TaskGroup(chat_ctx=self.chat_ctx)
+            callback_group.add(lambda: ScheduleCallbackTask(), id="schedule_callback", description="Schedule callback")
+            callback_group.add(lambda: ClosingTask(is_callback_path=True), id="closing", description="Close after callback")
+            results_callback = await callback_group
+            all_task_results.update(results_callback.task_results)
+
+        self._flow_results = _FlowResults(task_results=all_task_results)
+
+        logger.info("Flow complete: task_results=%s", list(all_task_results.keys()))
         await self.session.generate_reply(
-            instructions=get_step_instruction(self._flow_state)
+            instructions="Flow complete. Respond warmly and briefly to anything they say."
         )
 
     async def _monitor_silence(self) -> None:
@@ -135,44 +221,58 @@ class Assistant(Agent):
             metrics.characters_count, metrics.cancelled, ts,
         )
 
-    async def tts_node(
-        self, text: AsyncIterable[str], model_settings: ModelSettings
-    ) -> AsyncIterable[rtc.AudioFrame]:
-        chunks: list[str] = []
-        async def tee() -> AsyncIterable[str]:
-            async for chunk in text:
-                chunks.append(chunk)
-                yield chunk
-        async for frame in Agent.default.tts_node(self, tee(), model_settings):
-            yield frame
-        if chunks:
-            agent_message = "".join(chunks).strip()
-            if agent_message:
-                logger.info("Agent: %s", agent_message)
+    def get_transcript(self) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        for msg in self._chat_ctx.messages():
+            if msg.role not in ("user", "assistant"):
+                continue
+            text = (msg.text_content or "").strip()
+            if text:
+                out.append({"role": msg.role, "content": text})
+        return out
 
-    async def on_user_turn_completed(
-        self, turn_ctx: ChatContext, new_message: ChatMessage
-    ) -> None:
-        user_text = getattr(new_message, "text_content", None) or ""
-        if user_text:
-            logger.info("User: %s", user_text.strip())
-        next_state = get_next_state(self._flow_state, str(user_text or ""))
-        step_text = get_step_instruction(next_state)
-        turn_ctx.add_message(
-            role="user",
-            content=(
-                "[Directive—do not repeat or quote this.] "
-                "First acknowledge what the user said in their last message above "
-                "(e.g. Got it, Thanks, Sure, Sahi hai; or warm validation if they shared something personal or difficult). "
-                "Then do this: " + step_text + " "
-                "Reply in Maya's voice only; no meta or labels."
-            ),
-        )
-        self._flow_state = next_state
-        logger.info("Flow state -> %s", self._flow_state.value)
+    def get_flow_results_payload(self) -> dict | None:
+        if not self._flow_results:
+            return None
+        out = {}
+        for task_id, result in self._flow_results.task_results.items():
+            if hasattr(result, "__dict__"):
+                out[task_id] = {k: v for k, v in result.__dict__.items() if not k.startswith("_")}
+            else:
+                out[task_id] = str(result)
+        return out
+
 
 async def on_session_end(ctx: agents.JobContext) -> None:
     logger.info("Session ended: room=%s", ctx.room.name)
+    agent = _room_agents.pop(ctx.room.name, None)
+    webhook_url = os.getenv("SESSION_END_WEBHOOK_URL")
+    if not webhook_url or not agent:
+        return
+    transcript = agent.get_transcript()
+    payload = {"roomName": ctx.room.name, "transcript": transcript}
+    flow_results = agent.get_flow_results_payload()
+    if flow_results:
+        payload["flowResults"] = flow_results
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "Transcript webhook failed: %s %s body=%s",
+                        resp.status,
+                        resp.reason,
+                        await resp.text(),
+                    )
+                else:
+                    logger.info("Transcript sent to webhook for room=%s", ctx.room.name)
+    except Exception as e:
+        logger.warning("Transcript webhook error for room=%s: %s", ctx.room.name, e)
 
 
 def _prewarm(proc: agents.JobProcess) -> None:
@@ -182,12 +282,11 @@ def _prewarm(proc: agents.JobProcess) -> None:
         activation_threshold=0.3,
     )
 
-
 server = AgentServer()
 server.setup_fnc = _prewarm
 
 
-@server.rtc_session(on_session_end=on_session_end)
+@server.rtc_session(agent_name="maya-agent", on_session_end=on_session_end)
 async def my_agent(ctx: agents.JobContext):
     metadata_str = ctx.job.metadata or ctx.room.metadata or "{}"
     try:
@@ -195,10 +294,11 @@ async def my_agent(ctx: agents.JobContext):
     except json.JSONDecodeError:
         dial_info = {}
     phone_number = dial_info.get("phone_number")
-    logger.info("Agent started: room=%s phone=%s", ctx.room.name, phone_number or "N/A")
+    patient_name = dial_info.get("patient_name") or ""
+    logger.info("Agent started: room=%s phone=%s patient=%s", ctx.room.name, phone_number or "N/A", patient_name or "N/A")
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="en"),
+        stt=deepgram.STT(model="nova-3", language="multi"),
         llm=groq.LLM(
             model="meta-llama/llama-4-maverick-17b-128e-instruct",
             api_key=os.getenv("GROQ_API_KEY"),
@@ -213,13 +313,16 @@ async def my_agent(ctx: agents.JobContext):
         turn_detection="vad",
         preemptive_generation=True,
         min_interruption_duration=0.5,
-        min_interruption_words=0,
-        min_endpointing_delay=0.5,
+        min_interruption_words=2,
+        min_endpointing_delay=1.0,
+        max_endpointing_delay=3.0,
     )
 
+    assistant = Assistant(chat_ctx=ChatContext(), patient_name=patient_name)
+    _room_agents[ctx.room.name] = assistant
     await session.start(
         room=ctx.room,
-        agent=Assistant(chat_ctx=ChatContext()),
+        agent=assistant,
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (

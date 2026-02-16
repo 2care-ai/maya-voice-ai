@@ -6,6 +6,7 @@ __pycache__/
 *.so
 *.egg
 *.egg-info/
+*.pem
 dist/
 build/
 .venv/

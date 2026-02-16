@@ -5,6 +5,7 @@ description = ""
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "aiohttp>=3.9",
     "livekit-agents[google,silero,turn-detector,gladia,cartesia,elevenlabs,groq]~=1.3",
     "livekit-plugins-noise-cancellation~=0.2",
     "livekit-plugins-deepgram",
