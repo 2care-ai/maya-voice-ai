@@ -90,7 +90,7 @@ async def make_outbound_call(
         phone_number: Phone number to call (E.164 format, e.g., +919500664509)
         sip_trunk_id: SIP trunk ID to use for the call
         room_name: Optional room name (auto-generated if not provided)
-        patient_name: Optional patient name for the agent (default "John" in agent)
+        patient_name: Optional patient name for the agent (passed to agent; no default)
     """
     # Input validation
     if not phone_number or not sip_trunk_id:
@@ -123,7 +123,7 @@ async def make_outbound_call(
     print(f"   Phone: {phone_number}")
     print(f"   Trunk: {sip_trunk_id}")
     print(f"   Room: {room_name}")
-    print(f"   Patient name: {patient_name or '(default: John)'}")
+    print(f"   Patient name: {patient_name or '(not set)'}")
     print(f"   Agent: CA_3cRGBuHyaPh4")
     
     try:
@@ -199,7 +199,7 @@ async def main():
         print("  sip_trunk_id   - SIP trunk ID from LiveKit dashboard (starts with ST_)")
         print("\nOptional:")
         print("  room_name      - Custom room name (auto-generated if not provided)")
-        print("  patient_name  - Patient name for Maya (default: John)")
+        print("  patient_name  - Patient name for Maya (optional)")
         sys.exit(1)
 
     phone_number = sys.argv[1]

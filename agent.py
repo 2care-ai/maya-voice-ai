@@ -228,7 +228,7 @@ async def my_agent(ctx: agents.JobContext):
     except json.JSONDecodeError:
         dial_info = {}
     phone_number = dial_info.get("phone_number")
-    patient_name = dial_info.get("patient_name") or "John"
+    patient_name = dial_info.get("patient_name") or dial_info.get("patientName") or ""
     instructions = AGENT_INSTRUCTIONS.replace("{patient_name}", patient_name)
     logger.info("Agent started: room=%s phone=%s patient=%s", ctx.room.name, phone_number or "N/A", patient_name)
 
