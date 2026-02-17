@@ -77,43 +77,53 @@ async def _start_room_composite_egress(room_name: str, *, audio_only: bool = Tru
         await egress_api.aclose()
 
 
-async def make_outbound_call(phone_number: str, sip_trunk_id: str, room_name: str = None):
+async def make_outbound_call(
+    phone_number: str,
+    sip_trunk_id: str,
+    room_name: str | None = None,
+    patient_name: str | None = None,
+):
     """
     Initiate an outbound call via LiveKit SIP.
-    
+
     Args:
         phone_number: Phone number to call (E.164 format, e.g., +919500664509)
         sip_trunk_id: SIP trunk ID to use for the call
         room_name: Optional room name (auto-generated if not provided)
+        patient_name: Optional patient name for the agent (default "John" in agent)
     """
     # Input validation
     if not phone_number or not sip_trunk_id:
         print("❌ Error: phone_number and sip_trunk_id are required")
         return
-    
+
     # Create LiveKit API client
     lkapi = api.LiveKitAPI(
         url=os.getenv("LIVEKIT_URL"),
         api_key=os.getenv("LIVEKIT_API_KEY"),
         api_secret=os.getenv("LIVEKIT_API_SECRET")
     )
-    
+
     if not room_name:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         room_name = f"outbound-call-{timestamp}"
-    
-    # Prepare metadata
-    metadata = json.dumps({
+
+    # Prepare metadata (agent reads phone_number, patient_name from this)
+    meta = {
         "phone_number": phone_number,
         "sip_trunk_id": sip_trunk_id,
         "call_type": "outbound",
-        "initiated_at": datetime.now().isoformat()
-    })
+        "initiated_at": datetime.now().isoformat(),
+    }
+    if patient_name:
+        meta["patient_name"] = patient_name
+    metadata = json.dumps(meta)
     
     print(f"\n📞 Initiating outbound call...")
     print(f"   Phone: {phone_number}")
     print(f"   Trunk: {sip_trunk_id}")
     print(f"   Room: {room_name}")
+    print(f"   Patient name: {patient_name or '(default: John)'}")
     print(f"   Agent: CA_3cRGBuHyaPh4")
     
     try:
@@ -180,22 +190,24 @@ async def make_outbound_call(phone_number: str, sip_trunk_id: str, room_name: st
 
 async def main():
     if len(sys.argv) < 3:
-        print("Usage: python make_outbound_call.py <phone_number> <sip_trunk_id> [room_name]")
-        print("\nExample:")
+        print("Usage: python make_outbound_call.py <phone_number> <sip_trunk_id> [room_name] [patient_name]")
+        print("\nExamples:")
         print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp")
-        print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp my-room")
+        print("  python make_outbound_call.py +919500664509 ST_FKiPUcLVCjnp my-room Raj")
         print("\nRequired:")
-        print("  phone_number   - Phone number to call (with country code, e.g., +919876543210)")
-        print("  sip_trunk_id   - Your Twilio SIP trunk ID from LiveKit dashboard (starts with ST_)")
+        print("  phone_number   - Phone number to call (E.164, e.g., +919876543210)")
+        print("  sip_trunk_id   - SIP trunk ID from LiveKit dashboard (starts with ST_)")
         print("\nOptional:")
         print("  room_name      - Custom room name (auto-generated if not provided)")
+        print("  patient_name  - Patient name for Maya (default: John)")
         sys.exit(1)
-    
+
     phone_number = sys.argv[1]
     sip_trunk_id = sys.argv[2]
     room_name = sys.argv[3] if len(sys.argv) > 3 else None
-    
-    await make_outbound_call(phone_number, sip_trunk_id, room_name)
+    patient_name = sys.argv[4] if len(sys.argv) > 4 else None
+
+    await make_outbound_call(phone_number, sip_trunk_id, room_name, patient_name)
 
 
 if __name__ == "__main__":

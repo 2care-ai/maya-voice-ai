@@ -10,14 +10,11 @@ from dotenv import load_dotenv
 import aiohttp
 
 from livekit import agents, rtc
-from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
+from livekit.agents import AgentServer, AgentSession, Agent, room_io
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.voice import ModelSettings
 from livekit.plugins import deepgram, elevenlabs, groq, noise_cancellation, silero
-
-from flow import FlowState, get_step_instruction, get_next_state
-from everhope_store import get_everhope_knowledge_base
 
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
@@ -25,15 +22,17 @@ load_dotenv(_PROJECT_DIR / ".env")
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
 
-def _load_maya_instructions(compact: bool = True) -> str:
+
+def _load_maya_instructions() -> str:
     spec = importlib.util.spec_from_file_location(
-        "maya_prompt", _PROJECT_DIR / "maya-prompt.py"
+        "maya_prompt_single", _PROJECT_DIR / "maya-prompt-single.py"
     )
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.get_maya_instructions_compact() if compact else mod.get_maya_instructions()
+    return mod.get_maya_instructions()
 
-AGENT_INSTRUCTIONS = _load_maya_instructions(compact=True)
+
+AGENT_INSTRUCTIONS = _load_maya_instructions()
 
 TRANSCRIPT_DIR = _PROJECT_DIR / "transcripts"
 
@@ -59,37 +58,12 @@ class Assistant(Agent):
         self,
         chat_ctx: ChatContext | None = None,
         room_name: str | None = None,
+        instructions: str | None = None,
     ) -> None:
-        super().__init__(chat_ctx=chat_ctx, instructions=AGENT_INSTRUCTIONS)
+        super().__init__(chat_ctx=chat_ctx, instructions=instructions or AGENT_INSTRUCTIONS)
         self._silence_task = None
         self._last_speech_time = asyncio.get_event_loop().time()
-        self._flow_state = FlowState.RECORDING_INTRO
         self._room_name = room_name or ""
-
-    @function_tool(
-        description="Fetch Everhope Oncology center locations and details. Use when the user asks about centers, locations, addresses",
-        raw_schema={
-            "type": "function",
-            "name": "get_center_info",
-            "description": "Fetch Everhope Oncology center locations and details. Use when the user asks about centers, locations, addresses",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": [],
-            },
-        },
-    )
-    async def get_center_info(
-        self, raw_arguments: dict, ctx: RunContext
-    ) -> str:
-        try:
-            content = await asyncio.to_thread(get_everhope_knowledge_base)
-            if not content:
-                return "Center information is not available right now."
-            return content
-        except Exception as e:
-            logger.warning("get_center_info failed: %s", e)
-            return "I couldn't fetch center details at the moment."
 
     async def on_enter(self) -> None:
         def on_stt(metrics: STTMetrics) -> None:
@@ -112,9 +86,7 @@ class Assistant(Agent):
 
         self._silence_task = asyncio.create_task(self._monitor_silence())
 
-        await self.session.generate_reply(
-            instructions=get_step_instruction(self._flow_state)
-        )
+        await self.session.generate_reply(instructions="Begin the conversation with your first flow step.")
 
     async def _monitor_silence(self) -> None:
         while True:
@@ -183,20 +155,7 @@ class Assistant(Agent):
         if user_text:
             logger.info("User: %s", user_text.strip())
             _append_transcript(self._room_name, "user", user_text.strip())
-        next_state = get_next_state(self._flow_state, str(user_text or ""))
-        step_text = get_step_instruction(next_state)
-        turn_ctx.add_message(
-            role="user",
-            content=(
-                "[Directive—do not repeat or quote this.] "
-                "First acknowledge what the user said in their last message above "
-                "(e.g. Got it, Thanks, Sure, Sahi hai; or warm validation if they shared something personal or difficult). "
-                "Then do this: " + step_text + " "
-                "Reply in Hinglish (primary); use English only if the step or context calls for it. Prefer <hinglish/> from the step. Maya's voice only; no meta or labels."
-            ),
-        )
-        self._flow_state = next_state
-        logger.info("Flow state -> %s", self._flow_state.value)
+        # Single-prompt flow: no state or step injection; LLM follows instructions.
 
 async def _send_transcript_webhook(ctx: agents.JobContext) -> None:
     """Read transcript from local file and POST to SESSION_END_WEBHOOK_URL."""
@@ -269,7 +228,9 @@ async def my_agent(ctx: agents.JobContext):
     except json.JSONDecodeError:
         dial_info = {}
     phone_number = dial_info.get("phone_number")
-    logger.info("Agent started: room=%s phone=%s", ctx.room.name, phone_number or "N/A")
+    patient_name = dial_info.get("patient_name") or "John"
+    instructions = AGENT_INSTRUCTIONS.replace("{patient_name}", patient_name)
+    logger.info("Agent started: room=%s phone=%s patient=%s", ctx.room.name, phone_number or "N/A", patient_name)
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),  # multi = Hindi + English (Hinglish) code-switching
@@ -293,7 +254,7 @@ async def my_agent(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=Assistant(chat_ctx=ChatContext(), room_name=ctx.room.name),
+        agent=Assistant(chat_ctx=ChatContext(), room_name=ctx.room.name, instructions=instructions),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
