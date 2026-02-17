@@ -1,5 +1,4 @@
 import asyncio
-import importlib.util
 import json
 import logging
 import os
@@ -21,18 +20,6 @@ load_dotenv(_PROJECT_DIR / ".env")
 
 logger = logging.getLogger("agent")
 logger.setLevel(logging.INFO)
-
-
-def _load_maya_instructions() -> str:
-    spec = importlib.util.spec_from_file_location(
-        "maya_prompt_single", _PROJECT_DIR / "maya-prompt-single.py"
-    )
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.get_maya_instructions()
-
-
-AGENT_INSTRUCTIONS = _load_maya_instructions()
 
 TRANSCRIPT_DIR = _PROJECT_DIR / "transcripts"
 
@@ -60,7 +47,7 @@ class Assistant(Agent):
         room_name: str | None = None,
         instructions: str | None = None,
     ) -> None:
-        super().__init__(chat_ctx=chat_ctx, instructions=instructions or AGENT_INSTRUCTIONS)
+        super().__init__(chat_ctx=chat_ctx, instructions=instructions or "")
         self._silence_task = None
         self._last_speech_time = asyncio.get_event_loop().time()
         self._room_name = room_name or ""
@@ -220,17 +207,17 @@ server = AgentServer()
 server.setup_fnc = _prewarm
 
 
-@server.rtc_session(on_session_end=on_session_end)
+@server.rtc_session(agent_name=os.getenv("LIVEKIT_AGENT_NAME", "maya-agent"), on_session_end=on_session_end)
 async def my_agent(ctx: agents.JobContext):
+    # Job metadata is set by explicit agent dispatch (create_dispatch with metadata). Fall back to room metadata.
     metadata_str = ctx.job.metadata or ctx.room.metadata or "{}"
     try:
         dial_info = json.loads(metadata_str)
     except json.JSONDecodeError:
         dial_info = {}
     phone_number = dial_info.get("phone_number")
-    patient_name = dial_info.get("patient_name") or dial_info.get("patientName") or ""
-    instructions = AGENT_INSTRUCTIONS.replace("{patient_name}", patient_name)
-    logger.info("Agent started: room=%s phone=%s patient=%s", ctx.room.name, phone_number or "N/A", patient_name)
+    instructions = dial_info.get("prompt") or ""
+    logger.info("Agent started: room=%s phone=%s prompt_len=%s", ctx.room.name, phone_number or "N/A", len(instructions))
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3", language="multi"),  # multi = Hindi + English (Hinglish) code-switching

@@ -11,6 +11,7 @@ Requirements:
 """
 
 import asyncio
+import importlib.util
 import sys
 import os
 import json
@@ -22,6 +23,16 @@ from livekit import api
 
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
+
+
+def _load_maya_instructions() -> str:
+    """Load base Maya prompt from maya-prompt-single.py (same as agent used to use)."""
+    spec = importlib.util.spec_from_file_location(
+        "maya_prompt_single", _PROJECT_DIR / "maya-prompt-single.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.get_maya_instructions()
 
 
 def _env(key: str, default: str | None = None) -> str | None:
@@ -85,12 +96,13 @@ async def make_outbound_call(
 ):
     """
     Initiate an outbound call via LiveKit SIP.
+    Loads Maya prompt (maya-prompt-single), substitutes patient_name, and sends it as metadata "prompt" for the agent.
 
     Args:
         phone_number: Phone number to call (E.164 format, e.g., +919500664509)
         sip_trunk_id: SIP trunk ID to use for the call
         room_name: Optional room name (auto-generated if not provided)
-        patient_name: Optional patient name for the agent (passed to agent; no default)
+        patient_name: Optional patient name (substituted into the prompt as {patient_name})
     """
     # Input validation
     if not phone_number or not sip_trunk_id:
@@ -108,33 +120,42 @@ async def make_outbound_call(
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         room_name = f"outbound-call-{timestamp}"
 
-    # Prepare metadata (agent reads phone_number, patient_name from this)
+    # Build instructions: Maya prompt with {patient_name} replaced; agent uses only metadata "prompt"
+    base_instructions = _load_maya_instructions()
+    full_instructions = base_instructions.replace("{patient_name}", patient_name or "")
+
     meta = {
         "phone_number": phone_number,
         "sip_trunk_id": sip_trunk_id,
         "call_type": "outbound",
         "initiated_at": datetime.now().isoformat(),
+        "prompt": full_instructions,
     }
     if patient_name:
         meta["patient_name"] = patient_name
     metadata = json.dumps(meta)
-    
+
     print(f"\n📞 Initiating outbound call...")
     print(f"   Phone: {phone_number}")
     print(f"   Trunk: {sip_trunk_id}")
     print(f"   Room: {room_name}")
     print(f"   Patient name: {patient_name or '(not set)'}")
-    print(f"   Agent: CA_3cRGBuHyaPh4")
-    
+    print(f"   Prompt: Maya (maya-prompt-single, %s chars)" % len(full_instructions))
+    agent_name = os.getenv("LIVEKIT_AGENT_NAME", "maya-agent")
+    print(f"   Agent: {agent_name} (dispatch with metadata)")
+
     try:
-        # 1. Create the room
-        await lkapi.room.create_room(
-            api.CreateRoomRequest(
-                name=room_name,
-                metadata=metadata
+        # 1. Dispatch the agent first. Room is auto-created by dispatch if it doesn't exist (per LiveKit docs).
+        #    Doing this BEFORE creating the room ensures the only job the agent receives has our metadata.
+        #    If we created the room first, Cloud might dispatch a job with empty metadata when the room is created.
+        await lkapi.agent_dispatch.create_dispatch(
+            api.CreateAgentDispatchRequest(
+                agent_name=agent_name,
+                room=room_name,
+                metadata=metadata,
             )
         )
-        print(f"✅ Room created: {room_name}")
+        print(f"✅ Agent dispatched to room {room_name} (room auto-created by dispatch, metadata=%s chars)" % len(metadata))
 
         # 2. Start room composite egress (call recording to S3)
         await _start_room_composite_egress(room_name, audio_only=True)
@@ -199,7 +220,7 @@ async def main():
         print("  sip_trunk_id   - SIP trunk ID from LiveKit dashboard (starts with ST_)")
         print("\nOptional:")
         print("  room_name      - Custom room name (auto-generated if not provided)")
-        print("  patient_name  - Patient name for Maya (optional)")
+        print("  patient_name   - Patient name (substituted into Maya prompt)")
         sys.exit(1)
 
     phone_number = sys.argv[1]
