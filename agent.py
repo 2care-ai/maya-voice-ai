@@ -16,15 +16,13 @@ from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.voice.events import ConversationItemAddedEvent
 from livekit.agents.metrics import EOUMetrics, LLMMetrics, STTMetrics, TTSMetrics
 from livekit.agents.voice import ModelSettings
-from livekit.plugins import deepgram, elevenlabs, groq, noise_cancellation, silero
+from livekit.plugins import cartesia, deepgram, groq, noise_cancellation, silero
 
 from livekit.agents.beta.workflows import TaskGroup
 
 from everhope_store import get_everhope_knowledge_base
 from tasks.maya_flow import (
     ClosingTask,
-    ConfirmationTask,
-    DecisionTimelineTask,
     DiagnosisQualificationTask,
     GeographyTask,
     OpeningTask,
@@ -70,6 +68,7 @@ class Assistant(Agent):
         super().__init__(chat_ctx=chat_ctx, instructions=AGENT_INSTRUCTIONS)
         self._silence_task = None
         self._last_speech_time = asyncio.get_event_loop().time()
+        self._waiting_for_response = False
         self._flow_results = None
         self._patient_name = patient_name or ""
 
@@ -117,10 +116,13 @@ class Assistant(Agent):
         @self.session.on("user_speech_committed")
         def on_user_speech(_msg):
             self._last_speech_time = asyncio.get_event_loop().time()
+            self._waiting_for_response = True
 
         @self.session.on("conversation_item_added")
         def on_conversation_item(ev: ConversationItemAddedEvent) -> None:
             if isinstance(ev.item, ChatMessage) and ev.item.role == "assistant":
+                self._waiting_for_response = False
+                self._last_speech_time = asyncio.get_event_loop().time()
                 text = (ev.item.text_content or "").strip()
                 if text:
                     logger.info("[Agent speaks] %s", text)
@@ -141,28 +143,16 @@ class Assistant(Agent):
 
         if good_time:
             collect_group = TaskGroup(chat_ctx=self.chat_ctx)
-            collect_group.add(lambda: ConfirmationTask(), id="confirmation", description="Discuss report with doctor")
             collect_group.add(lambda: DiagnosisQualificationTask(), id="diagnosis", description="Diagnosis stage")
             collect_group.add(lambda: TreatmentStatusTask(), id="treatment", description="Treatment status")
             results_collect = await collect_group
             all_task_results.update(results_collect.task_results)
 
-            treatment_result = results_collect.task_results["treatment"]
-            treatment_started = getattr(treatment_result, "started", False)
-
-            if treatment_started:
-                rest_group = TaskGroup(chat_ctx=self.chat_ctx)
-                rest_group.add(lambda: GeographyTask(), id="geography", description="Geography and travel")
-                rest_group.add(lambda: ClosingTask(is_callback_path=False), id="closing", description="Thank and close")
-                results_rest = await rest_group
-                all_task_results.update(results_rest.task_results)
-            else:
-                rest_group = TaskGroup(chat_ctx=self.chat_ctx)
-                rest_group.add(lambda: DecisionTimelineTask(), id="timeline", description="Decision timeline")
-                rest_group.add(lambda: GeographyTask(), id="geography", description="Geography and travel")
-                rest_group.add(lambda: ClosingTask(is_callback_path=False), id="closing", description="Thank and close")
-                results_rest = await rest_group
-                all_task_results.update(results_rest.task_results)
+            rest_group = TaskGroup(chat_ctx=self.chat_ctx)
+            rest_group.add(lambda: GeographyTask(), id="geography", description="Geography and travel")
+            rest_group.add(lambda: ClosingTask(is_callback_path=False), id="closing", description="Thank and close")
+            results_rest = await rest_group
+            all_task_results.update(results_rest.task_results)
         else:
             callback_group = TaskGroup(chat_ctx=self.chat_ctx)
             callback_group.add(lambda: ScheduleCallbackTask(), id="schedule_callback", description="Schedule callback")
@@ -182,6 +172,8 @@ class Assistant(Agent):
             await asyncio.sleep(1.0)
             if self.session.current_speech is not None:
                 self._last_speech_time = asyncio.get_event_loop().time()
+                continue
+            if self._waiting_for_response:
                 continue
             elapsed = asyncio.get_event_loop().time() - self._last_speech_time
             if elapsed >= 10.0:
@@ -304,10 +296,11 @@ async def my_agent(ctx: agents.JobContext):
             api_key=os.getenv("GROQ_API_KEY"),
             max_completion_tokens=120,
         ),
-        tts=elevenlabs.TTS(
-            model="eleven_flash_v2_5",
-            voice_id=os.getenv("ELEVEN_LABS_VOICE_ID") or os.getenv("ELEVEN_LABS_DEFAULT_VOICE_ID"),
-            api_key=os.getenv("ELEVEN_LABS_API_KEY"),
+        tts=cartesia.TTS(
+            model="sonic-3",
+            voice=os.getenv("CARTESIA_VOICE_ID"),
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            speed=float(os.getenv("CARTESIA_SPEED", "1.0")),
         ),
         vad=ctx.proc.userdata["vad"],
         turn_detection="vad",

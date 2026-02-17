@@ -79,10 +79,17 @@
 
 ---
 
+## How generate_reply(instructions=...) works (LiveKit)
+
+- **Behavior**: For the STT-LLM-TTS pipeline, the string you pass as `instructions` is **prepended** to the **current agent’s** system instructions for that one reply: `effective = agent.instructions + "\n" + instructions`. The combined string is set on the chat context for the next LLM call. The instructions are **not** stored in chat history; only the model’s reply is.
+- **When called from inside a task**: The “current agent” may be the top-level Assistant (session’s agent), so the **task’s** strict rules (e.g. _COMMON) might not be in effect for that single call. To avoid the model outputting labels or preamble, either (1) include a short output rule in every `generate_reply(instructions=...)` (e.g. “Output only the words to speak (no labels): …”) or (2) use `session.say(text)` for that turn so the LLM is not used.
+- **Awaiting**: `generate_reply(...)` returns a `SpeechHandle`. Use `await session.generate_reply(...)` when you need the agent to finish speaking before continuing (e.g. before `self.complete()`).
+- **Inside a tool**: When `generate_reply` is called from inside a `function_tool`, the framework defaults `tool_choice="none"` so the model does not call another tool for that reply.
+
 ## Spoken output vs internal instructions
 
 - **Problem**: The LLM must not speak internal text (e.g. "Next step: ...", "Say:", task descriptions). Everything it outputs goes to TTS.
-- **Fix**: (1) Base and task instructions require output to be only the words the user should hear—no labels, instructions, or meta. (2) `generate_reply(instructions=...)` is phrased as "Output only the words to speak (no labels): ...". (3) When a tool returns a prescribed line (e.g. non-disclosure script from `record_confirmation(aware=False)`), task instructions tell the LLM to reply with exactly that line. (4) **Opening** uses `session.say(script)` so the first utterance is scripted and avoids LLM cold start. No post-processing or TTS filtering; behaviour is enforced via prompts only.
+- **Fix**: (1) Base and task instructions require output to be only the words the user should hear—no labels, instructions, or meta. (2) `generate_reply(instructions=...)` is phrased as "Output only the words to speak (no labels): ...". (3) When a tool returns a prescribed line (e.g. non-disclosure script from `record_confirmation(aware=False)`), task instructions tell the LLM to reply with exactly that line. (4) **Opening** and key turns use `session.say(script)` so the first utterance and critical replies are scripted and avoid LLM preamble. No post-processing or TTS filtering; behaviour is enforced via prompts only.
 
 ## Latency / cold start
 
