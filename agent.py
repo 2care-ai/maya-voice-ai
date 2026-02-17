@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterable
 from dotenv import load_dotenv
+import aiohttp
 
 from livekit import agents, rtc
 from livekit.agents import AgentServer, AgentSession, Agent, room_io, function_tool, RunContext
@@ -34,12 +35,36 @@ def _load_maya_instructions(compact: bool = True) -> str:
 
 AGENT_INSTRUCTIONS = _load_maya_instructions(compact=True)
 
+TRANSCRIPT_DIR = _PROJECT_DIR / "transcripts"
+
+
+def _append_transcript(room_name: str, role: str, content: str) -> None:
+    """Append one turn to local transcript file."""
+    if not content or not room_name:
+        return
+    TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
+    path = TRANSCRIPT_DIR / f"{room_name}.json"
+    try:
+        existing = []
+        if path.exists():
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        existing.append({"role": role, "content": content})
+        path.write_text(json.dumps(existing, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Transcript append failed: %s", e)
+
+
 class Assistant(Agent):
-    def __init__(self, chat_ctx: ChatContext | None = None) -> None:
+    def __init__(
+        self,
+        chat_ctx: ChatContext | None = None,
+        room_name: str | None = None,
+    ) -> None:
         super().__init__(chat_ctx=chat_ctx, instructions=AGENT_INSTRUCTIONS)
         self._silence_task = None
         self._last_speech_time = asyncio.get_event_loop().time()
         self._flow_state = FlowState.RECORDING_INTRO
+        self._room_name = room_name or ""
 
     @function_tool(
         description="Fetch Everhope Oncology center locations and details. Use when the user asks about centers, locations, addresses",
@@ -149,6 +174,7 @@ class Assistant(Agent):
             agent_message = "".join(chunks).strip()
             if agent_message:
                 logger.info("Agent: %s", agent_message)
+                _append_transcript(self._room_name, "agent", agent_message)
 
     async def on_user_turn_completed(
         self, turn_ctx: ChatContext, new_message: ChatMessage
@@ -156,6 +182,7 @@ class Assistant(Agent):
         user_text = getattr(new_message, "text_content", None) or ""
         if user_text:
             logger.info("User: %s", user_text.strip())
+            _append_transcript(self._room_name, "user", user_text.strip())
         next_state = get_next_state(self._flow_state, str(user_text or ""))
         step_text = get_step_instruction(next_state)
         turn_ctx.add_message(
@@ -165,15 +192,62 @@ class Assistant(Agent):
                 "First acknowledge what the user said in their last message above "
                 "(e.g. Got it, Thanks, Sure, Sahi hai; or warm validation if they shared something personal or difficult). "
                 "Then do this: " + step_text + " "
-                "Reply in Maya's voice only; no meta or labels."
+                "Reply in Hinglish (primary); use English only if the step or context calls for it. Prefer <hinglish/> from the step. Maya's voice only; no meta or labels."
             ),
         )
         self._flow_state = next_state
         logger.info("Flow state -> %s", self._flow_state.value)
 
+async def _send_transcript_webhook(ctx: agents.JobContext) -> None:
+    """Read transcript from local file and POST to SESSION_END_WEBHOOK_URL."""
+    webhook_url = (os.getenv("SESSION_END_WEBHOOK_URL") or "").strip()
+    if not webhook_url:
+        return
+    transcript: list = []
+    path = TRANSCRIPT_DIR / f"{ctx.room.name}.json"
+    if path.exists():
+        try:
+            transcript = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning("Transcript read failed: %s", e)
+        try:
+            path.unlink()
+        except Exception:
+            pass
+    metadata_str = ctx.job.metadata or ctx.room.metadata or "{}"
+    try:
+        dial_info = json.loads(metadata_str)
+    except json.JSONDecodeError:
+        dial_info = {}
+    payload = {
+        "room_name": ctx.room.name,
+        "phone_number": dial_info.get("phone_number"),
+        "transcript": transcript,
+        "ended_at": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                webhook_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning(
+                        "Session end webhook failed: status=%s url=%s",
+                        resp.status,
+                        webhook_url,
+                    )
+                else:
+                    logger.info("Session transcript sent to webhook: room=%s", ctx.room.name)
+    except Exception as e:
+        logger.warning("Session end webhook error: %s", e)
+
+
 async def on_session_end(ctx: agents.JobContext) -> None:
     logger.info("Session ended: room=%s", ctx.room.name)
-
+    await _send_transcript_webhook(ctx)
 
 def _prewarm(proc: agents.JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(
@@ -198,7 +272,7 @@ async def my_agent(ctx: agents.JobContext):
     logger.info("Agent started: room=%s phone=%s", ctx.room.name, phone_number or "N/A")
 
     session = AgentSession(
-        stt=deepgram.STT(model="nova-3", language="en"),
+        stt=deepgram.STT(model="nova-3", language="multi"),  # multi = Hindi + English (Hinglish) code-switching
         llm=groq.LLM(
             model="meta-llama/llama-4-maverick-17b-128e-instruct",
             api_key=os.getenv("GROQ_API_KEY"),
@@ -219,7 +293,7 @@ async def my_agent(ctx: agents.JobContext):
 
     await session.start(
         room=ctx.room,
-        agent=Assistant(chat_ctx=ChatContext()),
+        agent=Assistant(chat_ctx=ChatContext(), room_name=ctx.room.name),
         room_options=room_io.RoomOptions(
             audio_input=room_io.AudioInputOptions(
                 noise_cancellation=lambda params: (
@@ -230,7 +304,6 @@ async def my_agent(ctx: agents.JobContext):
             ),
         ),
     )
-
 
 if __name__ == "__main__":
     agents.cli.run_app(server)
